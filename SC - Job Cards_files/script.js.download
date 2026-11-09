@@ -1,0 +1,364 @@
+'use strict';
+/* ===== SC Corrugation Job Card System (plain HTML + CSS + JavaScript, no install needed) ===== */
+
+/* ---------- Calculations (same formulas as Job_Card_JS2751.xlsx) ---------- */
+const PLY_ROWS = { '3 Ply': 3, '5 Ply': 5, '7 Ply': 7 };
+const PLANTS = Object.keys(PLY_ROWS);
+const r1 = (x) => Math.round((x + Number.EPSILON) * 10) / 10;
+const toNum = (v) => (v === '' || v == null || !Number.isFinite(Number(v)) ? null : Number(v));
+const defaultTakeUp = (i) => (i % 2 === 1 ? 1.5 : 1); // row 1,3,5 = 1 ; row 2,4 = 1.5
+const blankLine = (i) => ({ code: '', material: '', reel: '', gsm: '', takeUp: defaultTakeUp(i || 0), open: '' });
+
+const cartonQty = (j) => (toNum(j.sheetQty) || 0) * (toNum(j.ups) || 0) * (toNum(j.pcs) || 0);
+
+function requiredWeight(job, l) {
+  const c = toNum(job.cInch), reel = toNum(l.reel), gsm = toNum(l.gsm), tu = toNum(l.takeUp);
+  if (c == null || reel == null || gsm == null || gsm <= 0 || tu == null) return null;
+  const w = (toNum(job.wastage) || 0) / 100;
+  return r1(c * 0.0254 * (reel * 0.0254) * gsm * (toNum(job.sheetQty) || 0) * tu * (1 + w) / 1000);
+}
+function lineCalc(job, l) {
+  const req = requiredWeight(job, l), open = toNum(l.open);
+  const close = open == null || req == null ? null : r1(open - req);
+  const used = ['code', 'material', 'reel', 'gsm', 'open'].some((k) => String(l[k] ?? '') !== '');
+  let status = '';
+  if (used) status = req == null ? 'GSM MISSING' : open == null ? 'NO STOCK DATA' : close < 0 ? 'SHORT' : 'OK';
+  return { required: req, close, status, used };
+}
+function jobCalc(job) {
+  const lines = (job.lines || []).map((l) => lineCalc(job, l));
+  const sum = (k) => r1(lines.reduce((a, x) => a + (x[k] || 0), 0));
+  const open = r1((job.lines || []).reduce((a, l) => a + (toNum(l.open) || 0), 0));
+  const count = (s) => lines.filter((x) => x.status === s).length;
+  return {
+    cartonQty: cartonQty(job), lines, totalOpen: open, totalRequired: sum('required'), totalClose: sum('close'),
+    short: count('SHORT'), gsmMissing: count('GSM MISSING'), noStock: count('NO STOCK DATA'),
+    overall: count('SHORT') ? 'SHORT' : count('GSM MISSING') ? 'GSM MISSING' : count('NO STOCK DATA') ? 'NO STOCK DATA' : lines.some((x) => x.used) ? 'OK' : '',
+  };
+}
+function validateJob(job) {
+  const e = [];
+  if (!String(job.jobNo ?? '').trim()) e.push('Job number (JS #) is required.');
+  if (!job.date) e.push('Date is required.');
+  if (!String(job.customerName ?? '').trim()) e.push('Customer name is required.');
+  if (!PLANTS.includes(job.plant)) e.push('Plant must be 3 Ply, 5 Ply or 7 Ply.');
+  const nn = { 'C (inch)': job.cInch, 'R (inch)': job.rInch, Ups: job.ups, 'Pcs/Ctn': job.pcs, 'Sheet Qty': job.sheetQty, 'Wastage %': job.wastage, Length: job.lengthMm, Width: job.widthMm, Height: job.heightMm };
+  for (const [k, v] of Object.entries(nn)) if (String(v ?? '') !== '' && (toNum(v) == null || toNum(v) < 0)) e.push(k + ' must be a number, 0 or more.');
+  (job.lines || []).forEach((l, i) => ['reel', 'gsm', 'takeUp', 'open'].forEach((k) => {
+    if (String(l[k] ?? '') !== '' && (toNum(l[k]) == null || toNum(l[k]) < 0)) e.push('Row ' + (i + 1) + ': ' + k + ' must be a number, 0 or more.');
+  }));
+  return e;
+}
+
+/* ---------- Storage (browser localStorage) ---------- */
+const KEY = 'sc_jobcards_v1';
+let DB = { seq: 1, jobs: [], history: [] };
+function loadDB() {
+  try { const raw = localStorage.getItem(KEY); if (raw) DB = JSON.parse(raw); } catch (e) { console.warn(e); }
+  if (!DB.jobs.length && !DB.history.length) seed();
+}
+const DEFAULT_MATERIALS = ['Box Board', 'N Dubai', 'Semi', 'Fluting', 'CMP', 'Ultra', 'Dubai'];
+function materials(extra) {
+  if (!Array.isArray(DB.materials)) DB.materials = [];
+  const out = [];
+  DEFAULT_MATERIALS.concat(DB.materials, extra || []).forEach((m) => { m = String(m || '').trim(); if (m && !out.some((x) => x.toLowerCase() === m.toLowerCase())) out.push(m); });
+  return out;
+}
+function addMaterial(name) {
+  name = String(name || '').trim(); if (!name) return '';
+  const hit = materials().find((x) => x.toLowerCase() === name.toLowerCase());
+  if (hit) return hit;
+  DB.materials.push(name); saveDB(); return name;
+}
+function saveDB() { try { localStorage.setItem(KEY, JSON.stringify(DB)); } catch (e) { alert('Could not save data in this browser: ' + e.message); } }
+const clone = (o) => JSON.parse(JSON.stringify(o));
+const nowStr = () => new Date().toISOString().replace('T', ' ').slice(0, 19);
+const today = () => { const d = new Date(); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); };
+function snap(job, action) { DB.history.push({ id: DB.history.length + 1, jobId: job.id, action, at: nowStr(), job: clone(job) }); }
+const getJob = (id) => DB.jobs.find((j) => j.id === Number(id));
+const jobNoExists = (no, exceptId) => DB.jobs.some((j) => String(j.jobNo).trim() === String(no).trim() && j.id !== Number(exceptId || 0));
+function nextJobNo() {
+  const nums = DB.jobs.map((j) => (/^\d+$/.test(String(j.jobNo)) ? Number(j.jobNo) : 0));
+  return String((nums.length ? Math.max(...nums) : 0) + 1);
+}
+function saveJob(job, id) {
+  const d = clone(job);
+  d.jobNo = String(d.jobNo).trim(); d.customerName = d.customerName.trim();
+  if (id) {
+    const i = DB.jobs.findIndex((j) => j.id === Number(id));
+    snap(DB.jobs[i], 'before edit');
+    d.id = Number(id); d.createdAt = DB.jobs[i].createdAt; d.updatedAt = nowStr();
+    DB.jobs[i] = d; snap(d, 'edited');
+  } else {
+    d.id = DB.seq++; d.createdAt = d.updatedAt = nowStr();
+    DB.jobs.push(d); snap(d, 'created');
+  }
+  saveDB(); return d.id;
+}
+function deleteJob(id) { const j = getJob(id); snap(j, 'deleted'); DB.jobs = DB.jobs.filter((x) => x.id !== j.id); saveDB(); }
+function duplicateJob(id) {
+  const d = clone(getJob(id)); d.jobNo = nextJobNo(); d.date = today(); d.status = 'Draft';
+  return saveJob(d, 0);
+}
+function seed() {
+  const L = (code, material, takeUp, open) => ({ code, material, reel: 50, gsm: '', takeUp, open });
+  DB = { seq: 1, jobs: [], history: [] };
+  saveJob({ jobNo: '2751', date: '2026-10-22', customerName: 'Saca plus / MS Corporation Kenco Ctn', customerCode: 'SC', nature: '', plant: '3 Ply',
+    cInch: 29.5, rInch: 50, ups: 3, pcs: 1, sheetQty: 670, lengthMm: 205, widthMm: 150, heightMm: 257, flap: '', notes: '', wastage: 0, status: 'Draft',
+    lines: [L('2186', 'N Dubai', 1, 965), L('420', 'CMP', 1.5, 190), L('2188', 'N Dubai', 1, 915)] }, 0);
+}
+
+/* ---------- Helpers ---------- */
+const $ = (s, r) => (r || document).querySelector(s);
+const $$ = (s, r) => Array.from((r || document).querySelectorAll(s));
+const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const fmt = (n) => (n == null || n === '' ? '—' : Number(n).toLocaleString('en-US', { maximumFractionDigits: 1 }));
+const dmy = (d) => (d ? d.split('-').reverse().join('/') : '');
+const pill = (s) => (!s ? '' : '<span class="pill ' + (s === 'OK' ? 'ok' : s === 'SHORT' ? 'bad' : 'warn') + '">' + esc(s) + '</span>');
+const main = () => $('#main');
+function go(name, id) { location.hash = '#/' + name + (id ? '/' + id : ''); }
+
+/* ---------- Router ---------- */
+function route() {
+  const [, name = 'dash', id] = location.hash.split('/');
+  $$('nav button').forEach((b) => b.classList.toggle('on', b.dataset.nav === name && !(name === 'form' && id)));
+  window.scrollTo(0, 0);
+  if (name === 'list') viewList();
+  else if (name === 'form') viewForm(id);
+  else if (name === 'view' && getJob(id)) viewJob(id);
+  else viewDash();
+}
+
+/* ---------- Dashboard ---------- */
+function viewDash() {
+  const jobs = DB.jobs.map((j) => ({ ...j, calc: jobCalc(j) })).sort((a, b) => (b.date + b.id).localeCompare(a.date + a.id));
+  const sum = (f) => jobs.reduce((a, j) => a + f(j), 0), r = (x) => Math.round(x * 10) / 10;
+  const by = {};
+  jobs.forEach((j) => { by[j.customerName] = (by[j.customerName] || 0) + j.calc.totalRequired; });
+  const byCustomer = Object.entries(by).sort((a, b) => b[1] - a[1]).slice(0, 6).map(([name, kg]) => ({ name, kg: r(kg) }));
+  const alerts = jobs.filter((j) => j.calc.short);
+  const incomplete = jobs.filter((j) => j.calc.gsmMissing || j.calc.noStock).length;
+  const max = Math.max(1, ...byCustomer.map((c) => c.kg));
+  const K = (v, l, bad) => '<div class="kpi' + (bad ? ' bad' : '') + '"><b>' + esc(v) + '</b><span>' + l + '</span></div>';
+  let chart = '<p class="muted">Enter GSM on job cards to see required weight.</p>';
+  if (byCustomer.some((c) => c.kg)) {
+    chart = '<svg viewBox="0 0 600 ' + (byCustomer.length * 30 + 10) + '" class="chart" role="img" aria-label="Required weight by customer">' + byCustomer.map((c, i) =>
+      '<g transform="translate(0 ' + i * 30 + ')"><text x="0" y="16" font-size="12" fill="currentColor">' + esc(c.name.slice(0, 26)) + '</text>' +
+      '<rect x="200" y="3" width="' + Math.max(2, (c.kg / max) * 330) + '" height="18" fill="var(--kraft)"/>' +
+      '<text x="' + (206 + (c.kg / max) * 330) + '" y="17" font-size="12" fill="currentColor">' + fmt(c.kg) + ' kg</text></g>').join('') + '</svg>';
+  }
+  main().innerHTML =
+    '<div class="bar"><h1>Dashboard</h1><div class="sp"></div>' +
+    '<button id="bk">Backup data</button><button id="rs">Restore backup</button><input type="file" id="rsf" accept=".json" hidden>' +
+    '<button class="p" data-go="form">New job card</button></div>' +
+    '<div class="kpis">' + K(jobs.length, 'Total job cards') + K(fmt(sum((j) => toNum(j.sheetQty) || 0)), 'Total sheet quantity') + K(fmt(sum((j) => j.calc.cartonQty)), 'Total carton quantity') +
+    K(fmt(r(sum((j) => j.calc.totalRequired))) + ' kg', 'Total required reel weight') + K(fmt(r(sum((j) => j.calc.totalOpen))) + ' kg', 'Total available reel stock') + K(alerts.length, 'Short stock alerts', alerts.length > 0) + '</div>' +
+    (alerts.length ? '<div class="ban bad">Short stock: ' + alerts.map((a) => '<button class="lnk" data-go="view" data-id="' + a.id + '">JS ' + esc(a.jobNo) + ' (' + a.calc.short + ' reel' + (a.calc.short > 1 ? 's' : '') + ')</button>').join('') + '</div>' : '') +
+    (incomplete ? '<div class="ban warn">' + incomplete + ' job card(s) have missing GSM or stock figures, so their weights are incomplete and not counted as zero stock.</div>' : '') +
+    '<div class="card"><h2>Required reel weight by customer</h2>' + chart + '</div>' +
+    '<div class="card"><h2>Recent job cards</h2>' + jobTable(jobs.slice(0, 8), false) + '</div>';
+  bindGo();
+  $('#bk').onclick = () => download('sc-jobcards-backup-' + today() + '.json', JSON.stringify(DB, null, 1), 'application/json');
+  $('#rs').onclick = () => $('#rsf').click();
+  $('#rsf').onchange = (e) => {
+    const f = e.target.files[0]; if (!f) return;
+    const rd = new FileReader();
+    rd.onload = () => { try { const d = JSON.parse(rd.result); if (!Array.isArray(d.jobs)) throw new Error('Not a job card backup.');
+      if (confirm('Replace all current data with this backup?')) { DB = d; saveDB(); viewDash(); } } catch (x) { alert('Restore failed: ' + x.message); } };
+    rd.readAsText(f);
+  };
+}
+function bindGo(root) {
+  $$('[data-go]', root).forEach((el) => { el.onclick = (e) => { e.stopPropagation(); go(el.dataset.go, el.dataset.id); }; });
+}
+
+/* ---------- Job table + list ---------- */
+function jobTable(jobs, actions) {
+  if (!jobs.length) return '<p class="empty">No job cards found.</p>';
+  return '<div class="tw"><table><thead><tr><th>JS #</th><th>Date</th><th>Customer</th><th>Plant</th><th class="n">Sheets</th><th class="n">Cartons</th><th class="n">Required kg</th><th>Stock check</th><th>Status</th>' + (actions ? '<th></th>' : '') + '</tr></thead><tbody>' +
+    jobs.map((j) => '<tr class="click" data-go="view" data-id="' + j.id + '"><td><b>' + esc(j.jobNo) + '</b></td><td>' + dmy(j.date) + '</td><td>' + esc(j.customerName) + '</td><td>' + esc(j.plant) +
+      '</td><td class="n">' + fmt(j.sheetQty) + '</td><td class="n">' + fmt(j.calc.cartonQty) + '</td><td class="n">' + (j.calc.lines.some((l) => l.required != null) ? fmt(j.calc.totalRequired) : '—') +
+      '</td><td>' + pill(j.calc.overall) + '</td><td>' + esc(j.status) + '</td>' +
+      (actions ? '<td><button data-act="edit" data-id="' + j.id + '">Edit</button> <button data-act="dup" data-id="' + j.id + '">Duplicate</button> <button class="d" data-act="del" data-id="' + j.id + '">Delete</button></td>' : '') + '</tr>').join('') + '</tbody></table></div>';
+}
+function viewList() {
+  main().innerHTML = '<div class="bar"><h1>Job cards</h1><div class="sp"></div><button class="p" data-go="form">New job card</button></div>' +
+    '<div class="card"><div class="grid">' +
+    '<label class="f"><span>Search job number or customer</span><input id="fq"></label>' +
+    '<label class="f"><span>Date from</span><input type="date" id="ff"></label>' +
+    '<label class="f"><span>Date to</span><input type="date" id="ft"></label></div><div id="tbl"></div></div>';
+  const draw = () => {
+    const q = $('#fq').value.trim().toLowerCase(), from = $('#ff').value, to = $('#ft').value;
+    const jobs = DB.jobs.filter((j) => (!q || String(j.jobNo).toLowerCase().includes(q) || j.customerName.toLowerCase().includes(q)) && (!from || j.date >= from) && (!to || j.date <= to))
+      .map((j) => ({ ...j, calc: jobCalc(j) })).sort((a, b) => (b.date + b.id).localeCompare(a.date + a.id));
+    $('#tbl').innerHTML = jobTable(jobs, true);
+    bindGo($('#tbl'));
+    $$('[data-act]', $('#tbl')).forEach((b) => { b.onclick = (e) => { e.stopPropagation(); const id = b.dataset.id, j = getJob(id);
+      if (b.dataset.act === 'edit') go('form', id);
+      else if (b.dataset.act === 'dup') go('form', duplicateJob(id));
+      else if (confirm('Delete job card JS ' + j.jobNo + '? Its data is kept in history, but the card will be removed.')) { deleteJob(id); draw(); } }; });
+  };
+  ['fq', 'ff', 'ft'].forEach((i) => ($('#' + i).oninput = draw));
+  bindGo(); draw();
+}
+
+/* ---------- Form ---------- */
+function viewForm(id) {
+  let job = id && getJob(id) ? clone(getJob(id)) : { jobNo: nextJobNo(), date: today(), customerName: '', customerCode: '', nature: '', plant: '3 Ply', cInch: '', rInch: '', ups: 1, pcs: 1, sheetQty: '',
+    lengthMm: '', widthMm: '', heightMm: '', flap: '', notes: '', wastage: 0, status: 'Draft', lines: [blankLine(0), blankLine(1), blankLine(2)] };
+  if (!id || !getJob(id)) id = '';
+  const t = (k, label, extra) => '<label class="f"><span>' + label + '</span><input data-k="' + k + '" value="' + esc(job[k]) + '" ' + (extra || '') + '></label>';
+  const nm = (k, label) => '<label class="f"><span>' + label + '</span><input type="number" min="0" step="any" inputmode="decimal" data-k="' + k + '" value="' + esc(job[k]) + '"></label>';
+  main().innerHTML =
+    '<div class="bar"><h1>' + (id ? 'Edit job card JS ' + esc(job.jobNo) : 'New job card') + '</h1><div class="sp"></div><button data-go="list">Cancel</button><button class="p" data-save>Save job card</button></div>' +
+    '<div id="errs"></div>' +
+    '<div class="card"><h2>Job information</h2><div class="grid">' +
+    '<label class="f"><span>Date</span><input type="date" data-k="date" value="' + esc(job.date) + '"></label>' +
+    '<label class="f"><span>Job number (JS #)</span><input data-k="jobNo" value="' + esc(job.jobNo) + '"><em class="bad-t" id="dupno"></em></label>' +
+    t('customerName', 'Customer name') + t('customerCode', 'Customer code (SC)') + t('nature', 'Job nature') +
+    '<label class="f"><span>Plant</span><select data-k="plant">' + PLANTS.map((p) => '<option' + (p === job.plant ? ' selected' : '') + '>' + p + '</option>').join('') + '</select></label></div></div>' +
+    '<div class="card"><h2>Carton details</h2><div class="grid">' + nm('cInch', 'C (inch)') + nm('rInch', 'R (inch)') + nm('ups', 'Ups') + nm('pcs', 'Pcs/Ctn') + nm('sheetQty', 'Sheet qty') + nm('wastage', 'Wastage (%)') +
+    '<label class="f"><span>Carton qty (automatic)</span><div class="calc" id="cq"></div></label></div>' +
+    '<h3>Carton size</h3><div class="grid">' + nm('lengthMm', 'Length (mm)') + nm('widthMm', 'Width (mm)') + nm('heightMm', 'Height (mm)') + t('flap', 'Flap size') + t('notes', 'Notes') + '</div></div>' +
+    '<div class="card"><div class="bar"><h2>Reel / paper material</h2><div class="sp"></div><button id="addrow">Add row</button></div><div id="banners"></div><div id="lines"></div>' +
+        '<p class="muted">Take-up fills automatically by row: rows 1, 3, 5 = 1 and rows 2, 4 = 1.5. You can change it. Choosing 5 Ply or 7 Ply adds the matching rows.</p></div>' +
+    '<div class="bar"><button class="p" data-save>Save job card</button><button data-go="list">Cancel</button></div>';
+  bindGo();
+
+  const drawLines = () => {
+    $('#lines').innerHTML = '<div class="tw"><table><thead><tr><th>No.</th><th>Code</th><th>Material</th><th>Reel size (inch)</th><th>GSM</th><th>Take-up</th><th>Open balance (kg)</th><th class="n">Required (kg)</th><th class="n">Close balance (kg)</th><th>Status</th><th></th></tr></thead><tbody>' +
+      job.lines.map((l, i) => '<tr><td>' + (i + 1) + '</td>' +
+        '<td><input data-i="' + i + '" data-l="code" value="' + esc(l.code) + '"></td>' +
+        '<td><select data-i="' + i + '" data-l="material"><option value="">- select -</option>' + materials(l.material).map((m) => '<option' + (m === l.material ? ' selected' : '') + '>' + esc(m) + '</option>').join('') + '<option value="__new__">+ Add new material...</option></select></td>' +
+        ['reel', 'gsm', 'takeUp', 'open'].map((k) => '<td><input type="number" min="0" step="any" inputmode="decimal" data-i="' + i + '" data-l="' + k + '" value="' + esc(l[k]) + '"></td>').join('') +
+        '<td class="n"><div class="calc" id="rq' + i + '"></div></td><td class="n"><div class="calc" id="cl' + i + '"></div></td><td id="st' + i + '"></td>' +
+        '<td><button class="d" data-rm="' + i + '" aria-label="Remove row ' + (i + 1) + '">×</button></td></tr>').join('') +
+      '</tbody><tfoot><tr><th colspan="6">Total</th><th class="n" id="tO"></th><th class="n" id="tR"></th><th class="n" id="tC"></th><th colspan="2"></th></tr></tfoot></table></div>';
+    $$('[data-l]').forEach((inp) => {
+      inp.oninput = () => {
+        const i = Number(inp.dataset.i), k = inp.dataset.l, l = job.lines[i], oldMat = l.material;
+        if (k === 'material' && inp.value === '__new__') {
+          const nm = addMaterial(prompt('New material name:'));
+          l.material = nm || oldMat; drawLines(); return;
+        }
+        l[k] = inp.value;
+        update();
+      };
+    });
+    $$('[data-rm]').forEach((b) => { b.onclick = () => { job.lines.splice(Number(b.dataset.rm), 1); drawLines(); update(); }; });
+    update();
+  };
+  function update() {
+    const c = jobCalc(job);
+    $('#cq').textContent = fmt(c.cartonQty);
+    c.lines.forEach((x, i) => { $('#rq' + i).textContent = fmt(x.required); $('#cl' + i).textContent = fmt(x.close); $('#st' + i).innerHTML = pill(x.status); });
+    $('#tO').textContent = fmt(c.totalOpen); $('#tR').textContent = fmt(c.totalRequired); $('#tC').textContent = fmt(c.totalClose);
+    $('#banners').innerHTML =
+      (c.short ? '<div class="ban bad">' + c.short + ' reel(s) are short. Available stock is not enough.</div>' : '') +
+      (c.gsmMissing ? '<div class="ban warn">Enter GSM on every used row. Required weight is not calculated without it.</div>' : '') +
+      (c.noStock ? '<div class="ban warn">Open balance is blank on ' + c.noStock + ' row(s). Blank stock is not treated as zero, so enter the balance to check it.</div>' : '');
+    $('#dupno').textContent = job.jobNo && jobNoExists(job.jobNo, id) ? 'Already used' : '';
+  }
+  $$('[data-k]').forEach((inp) => {
+    inp.oninput = () => {
+      const k = inp.dataset.k; job[k] = inp.value;
+      if (k === 'plant') {
+        const want = PLY_ROWS[inp.value];
+        while (job.lines.length < want) job.lines.push(blankLine(job.lines.length));
+        while (job.lines.length > want && !Object.values(job.lines[job.lines.length - 1]).some((v) => v !== '')) job.lines.pop();
+        drawLines();
+      } else update();
+    };
+  });
+  $('#addrow').onclick = () => { job.lines.push(blankLine(job.lines.length)); drawLines(); };
+  $$('[data-save]').forEach((b) => (b.onclick = () => {
+    const e = validateJob(job);
+    if (jobNoExists(job.jobNo, id)) e.push('Job number ' + job.jobNo + ' already exists.');
+    if (e.length) { $('#errs').innerHTML = '<div class="ban bad">' + e.map((x) => '<div>' + esc(x) + '</div>').join('') + '</div>'; window.scrollTo(0, 0); return; }
+    go('view', saveJob(job, id));
+  }));
+  drawLines();
+}
+
+/* ---------- Job card view / print ---------- */
+function sheetHTML(job) {
+  const c = jobCalc(job);
+  return '<div class="sheet"><div class="co">SC</div><h1>CORRUGATION PLANT – JOB CARD</h1>' +
+    '<table class="g"><tbody>' +
+    '<tr><th>Date</th><td>' + dmy(job.date) + '</td><th>SC</th><td>' + esc(job.customerCode) + '</td><th>Job nature</th><td colspan="3">' + esc(job.nature) + '</td></tr>' +
+    '<tr><th>JS #</th><td>' + esc(job.jobNo) + '</td><th>Customer</th><td colspan="3">' + esc(job.customerName) + '</td><th>Plant</th><td>' + esc(job.plant) + '</td></tr>' +
+    '<tr><th>C (inch)</th><td>' + esc(job.cInch) + '</td><th>R (inch)</th><td>' + esc(job.rInch) + '</td><th>Ups</th><td>' + esc(job.ups) + '</td><th>Pcs/Ctn</th><td>' + esc(job.pcs) + '</td></tr>' +
+    '<tr><th>Sheet qty</th><td>' + fmt(job.sheetQty) + '</td><th>Ctn qty</th><td><b>' + fmt(c.cartonQty) + '</b></td><th>Wastage %</th><td>' + esc(job.wastage) + '</td><th>Carton size</th><td>' + esc(job.lengthMm) + ' × ' + esc(job.widthMm) + ' × ' + esc(job.heightMm) + ' mm</td></tr>' +
+    '<tr><th>Flap</th><td>' + esc(job.flap) + '</td><th>Note</th><td colspan="5">' + esc(job.notes) + '</td></tr></tbody></table>' +
+    '<table class="m"><thead><tr><th>No</th><th>Code</th><th>Material</th><th>Size (inch)</th><th>GSM</th><th>Take-up</th><th>Open bal. (kg)</th><th>Required (kg)</th><th>Close bal. (kg)</th><th>Status</th></tr></thead><tbody>' +
+    job.lines.map((l, i) => '<tr class="' + (c.lines[i].status === 'SHORT' ? 'sh' : '') + '"><td>' + (i + 1) + '</td><td>' + esc(l.code) + '</td><td>' + esc(l.material) + '</td><td>' + esc(l.reel) + '</td><td>' + esc(l.gsm) + '</td><td>' + esc(l.takeUp) + '</td>' +
+      '<td>' + (l.open === '' ? '' : fmt(l.open)) + '</td><td>' + (c.lines[i].required == null ? '' : fmt(c.lines[i].required)) + '</td><td>' + (c.lines[i].close == null ? '' : fmt(c.lines[i].close)) + '</td><td>' + esc(c.lines[i].status) + '</td></tr>').join('') +
+    '</tbody><tfoot><tr><th colspan="6">TOTAL</th><th>' + fmt(c.totalOpen) + '</th><th>' + fmt(c.totalRequired) + '</th><th>' + fmt(c.totalClose) + '</th><th></th></tr></tfoot></table>' +
+    '<div class="sig">' + ['Prepared by', 'Production', 'Store', 'Approved by'].map((s) => '<div>' + s + '</div>').join('') + '</div></div>';
+}
+function viewJob(id) {
+  const job = getJob(id), c = jobCalc(job);
+  const hist = DB.history.filter((h) => h.jobId === job.id).reverse();
+  main().innerHTML =
+    '<div class="bar no-print"><button data-go="list">Back</button><div class="sp"></div>' +
+    '<button data-go="form" data-id="' + id + '">Edit</button><button id="dup">Duplicate</button><button id="xls">Export Excel</button>' +
+    '<button id="pdf" title="Choose \'Save as PDF\' as the printer">Save as PDF</button><button class="p" id="prn">Print</button></div>' +
+    (c.overall && c.overall !== 'OK' ? '<div class="ban no-print ' + (c.short ? 'bad' : 'warn') + '">Stock check: ' + c.overall + '</div>' : '') +
+    sheetHTML(job) +
+    '<div class="card no-print"><h2>History</h2>' + hist.map((h) => '<div class="muted">' + h.at + ' UTC · ' + esc(h.action) + '</div>').join('') + '</div>';
+  bindGo();
+  $('#dup').onclick = () => go('form', duplicateJob(id));
+  $('#prn').onclick = $('#pdf').onclick = () => window.print();
+  $('#xls').onclick = () => download('JobCard_JS' + job.jobNo + '.xls', buildXls(job), 'application/vnd.ms-excel');
+}
+
+/* ---------- Excel export (SpreadsheetML: opens in Excel with live formulas) ---------- */
+function buildXls(job) {
+  const g = {}; // g[row][col] = {v, f, b}
+  const put = (a, v, o) => { const m = /^([A-Z]+)(\d+)$/.exec(a); const col = m[1].split('').reduce((s, ch) => s * 26 + ch.charCodeAt(0) - 64, 0), row = Number(m[2]);
+    (g[row] = g[row] || {})[col] = Object.assign({ v }, o || {}); };
+  const x = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  put('A1', 'SC - CORRUGATION PLANT - JOB CARD', { b: 1 });
+  put('A3', 'Date', { b: 1 }); put('B3', dmy(job.date)); put('D3', 'SC', { b: 1 }); put('E3', job.customerCode); put('G3', 'Job Nature', { b: 1 }); put('H3', job.nature);
+  put('A4', 'JS #', { b: 1 }); put('B4', Number(job.jobNo) || job.jobNo); put('D4', 'Customer', { b: 1 }); put('E4', job.customerName); put('H4', 'Plant', { b: 1 }); put('I4', job.plant.toUpperCase());
+  [['A6', 'C (inch)'], ['C6', 'R (inch)'], ['E6', 'Ups'], ['G6', 'Pcs/Ctn'], ['I6', 'Sheet Qty']].forEach(([a, t]) => put(a, t, { b: 1 }));
+  [['B6', job.cInch], ['D6', job.rInch], ['F6', job.ups], ['H6', job.pcs], ['J6', job.sheetQty]].forEach(([a, v]) => put(a, toNum(v)));
+  put('A7', 'Carton Size', { b: 1 }); [['B7', 'L (mm)'], ['C7', 'W (mm)'], ['D7', 'H (mm)'], ['E7', 'Flap Size'], ['F7', 'Note']].forEach(([a, t]) => put(a, t, { b: 1 }));
+  put('I7', 'Ctn Qty', { b: 1 }); put('J7', cartonQty(job), { f: 'R6C10*R6C6*R6C8' });
+  put('B8', toNum(job.lengthMm)); put('C8', toNum(job.widthMm)); put('D8', toNum(job.heightMm)); put('E8', job.flap); put('F8', job.notes);
+  put('I8', 'Wastage %', { b: 1 }); put('J8', toNum(job.wastage) || 0);
+  ['No', 'Code', 'Material', 'Size (inch)', 'GSM', 'Take-up Factor', 'Open Balance (kg)', 'Required Weight (kg)', 'Close Balance (kg)', 'Status'].forEach((t, i) => put(String.fromCharCode(65 + i) + '10', t, { b: 1 }));
+  const c = jobCalc(job), first = 11, last = first + job.lines.length - 1;
+  job.lines.forEach((l, i) => { const r = first + i, lc = c.lines[i];
+    put('A' + r, i + 1); put('B' + r, l.code); put('C' + r, l.material); put('D' + r, toNum(l.reel)); put('E' + r, toNum(l.gsm)); put('F' + r, toNum(l.takeUp)); put('G' + r, toNum(l.open));
+    put('H' + r, lc.required == null ? '' : lc.required, { f: 'IF(OR(R6C2="",RC4="",RC5="",RC6=""),"",ROUND(R6C2*0.0254*RC4*0.0254*RC5*R6C10*RC6*(1+R8C10/100)/1000,1))' });
+    put('I' + r, lc.close == null ? '' : lc.close, { f: 'IF(OR(RC7="",RC8=""),"",ROUND(RC7-RC8,1))' });
+    put('J' + r, lc.close == null ? '' : lc.close < 0 ? 'SHORT' : 'OK', { f: 'IF(RC9="","",IF(RC9<0,"SHORT","OK"))' }); });
+  const t = last + 1; put('A' + t, 'TOTAL', { b: 1 });
+  [['G', 7, c.totalOpen], ['H', 8, c.totalRequired], ['I', 9, c.totalClose]].forEach(([L, n, v]) => put(L + t, v, { b: 1, f: 'SUM(R' + first + 'C' + n + ':R' + last + 'C' + n + ')' }));
+  put('A' + (t + 2), 'Required Weight = C x 0.0254 x Size x 0.0254 x GSM x Sheet Qty x Take-up x (1 + Wastage%/100) / 1000.  Close Balance = Open Balance - Required Weight.');
+  let rows = '';
+  Object.keys(g).map(Number).sort((a, b) => a - b).forEach((r) => {
+    rows += '<Row ss:Index="' + r + '">';
+    Object.keys(g[r]).map(Number).sort((a, b) => a - b).forEach((col) => {
+      const cell = g[r][col], v = cell.v, isNum = typeof v === 'number' && Number.isFinite(v);
+      if (v == null || (v === '' && !cell.f)) return;
+      rows += '<Cell ss:Index="' + col + '"' + (cell.b ? ' ss:StyleID="b"' : '') + (cell.f ? ' ss:Formula="=' + x(cell.f) + '"' : '') + '><Data ss:Type="' + (isNum ? 'Number' : 'String') + '">' + x(v) + '</Data></Cell>';
+    });
+    rows += '</Row>';
+  });
+  return '<?xml version="1.0"?><?mso-application progid="Excel.Sheet"?>' +
+    '<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">' +
+    '<Styles><Style ss:ID="b"><Font ss:Bold="1"/></Style></Styles><Worksheet ss:Name="Job Card"><Table>' +
+    [9, 11, 14, 12, 11, 13, 15, 16, 16, 14].map((w) => '<Column ss:Width="' + w * 6 + '"/>').join('') + rows + '</Table></Worksheet></Workbook>';
+}
+function download(name, text, type) {
+  const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type })); a.download = name;
+  document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+/* ---------- Start ---------- */
+$$('nav button').forEach((b) => (b.onclick = () => go(b.dataset.nav)));
+window.addEventListener('hashchange', route);
+loadDB();
+route();
